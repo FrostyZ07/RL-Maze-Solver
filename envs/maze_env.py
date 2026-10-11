@@ -16,6 +16,8 @@ class MazeEnv(gym.Env):
     TIME_SLACK = 1.5        # episode budget = slack * estimated actions for the shortest route
     WALL_PENALTY = 0.05
     OBSTACLE_PENALTY = 1.0
+    LIDAR_NOISE = 0.05      # std (m) of Gaussian noise on each lidar reading
+    ACTION_NOISE = 0.1      # std of relative error on forward/turn speed (wheel slip)
 
     def __init__(self, render_mode=None, fixed=False):
         super(MazeEnv, self).__init__()
@@ -37,11 +39,12 @@ class MazeEnv(gym.Env):
         self.action_space = spaces.Discrete(3)
 
         # Observation space:
-        # [goal_visible, dist_to_target, sin(heading_error), cos(heading_error), lidar_1, ..., lidar_N]
-        # the three goal values are 0 unless the goal is in line of sight; 4 + 32 = 36
+        # [time_left, goal_visible, dist_to_target, sin(heading_error), cos(heading_error), lidar_1, ..., lidar_N]
+        # time_left = fraction of the step budget remaining (1 -> 0)
+        # the three goal values are 0 unless the goal is in line of sight; 5 + 32 = 37
         self.num_lidar_rays = 32
         self.lidar_range = 10.0
-        obs_dim = 4 + self.num_lidar_rays
+        obs_dim = 5 + self.num_lidar_rays
 
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
@@ -265,6 +268,10 @@ class MazeEnv(gym.Env):
         euler = p.getEulerFromQuaternion(orn)
         yaw = euler[2]
 
+        # Movement noise: the commanded speed is never exactly what you get
+        forward_speed *= 1 + self.ACTION_NOISE * self.np_random.standard_normal()
+        turn_speed *= 1 + self.ACTION_NOISE * self.np_random.standard_normal()
+
         vx = forward_speed * np.cos(yaw)
         vy = forward_speed * np.sin(yaw)
 
@@ -347,8 +354,13 @@ class MazeEnv(gym.Env):
             ray_to = [pos[0] + self.lidar_range * c, pos[1] + self.lidar_range * s, pos[2]]
             hit_fraction = p.rayTest(ray_from, ray_to)[0][2]
             lidar_readings.append(r0 + hit_fraction * (self.lidar_range - r0))
+        # Sensor noise
+        lidar_readings = np.clip(np.array(lidar_readings)
+                                 + self.LIDAR_NOISE * self.np_random.standard_normal(self.num_lidar_rays),
+                                 0.0, self.lidar_range)
 
-        obs = np.concatenate([goal_obs, lidar_readings])
+        time_left = 1.0 - self.step_count / self.max_steps
+        obs = np.concatenate([[time_left], goal_obs, lidar_readings])
         return obs.astype(np.float32)
 
     def close(self):
