@@ -1,0 +1,10 @@
+gymnasium
+stable-baselines3[extra]
+pybullet
+torch --index-url https://download.pytorch.org/whl/cpu
+flask
+tensorboard
+numpy
+matplotlib
+pytest
+pip-audit
