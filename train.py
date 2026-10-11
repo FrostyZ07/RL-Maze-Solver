@@ -13,7 +13,7 @@ def train():
     log_dir = "logs/"
     os.makedirs(log_dir, exist_ok=True)
     
-    # Initialize environment
+    # Initialize environment: a new random maze + goal every episode
     env = MazeEnv(render_mode=None) # No GUI for training speed
     
     # Check if environment follows Gym API
@@ -25,6 +25,7 @@ def train():
     env = VecFrameStack(DummyVecEnv([lambda: Monitor(env)]), 4)
 
     # ent_coef=0.01 is better for Discrete actions (max entropy is ~1.1)
+    # Always from scratch: obs size changed (36), old checkpoints are incompatible
     model = PPO("MlpPolicy", env, verbose=1, tensorboard_log=log_dir, device="cpu",
                 n_steps=2048, batch_size=64, gamma=0.99, ent_coef=0.03)
     
@@ -32,9 +33,7 @@ def train():
     checkpoint_callback = CheckpointCallback(save_freq=10000, save_path=log_dir, name_prefix="ppo_maze")
     
     print("Starting training...")
-    # Train
-    # Short training for PoC, can be increased
-    total_timesteps = 500000 
+    total_timesteps = 2_000_000
     model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback, tb_log_name="PPO_run")
     
     print("Training finished.")
