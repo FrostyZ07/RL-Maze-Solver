@@ -1,6 +1,7 @@
 import glob
 import os
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from envs.maze_env import MazeEnv
 
 def solve_maze():
@@ -16,17 +17,18 @@ def solve_maze():
     print(f"Loading {model_path}")
     model = PPO.load(model_path)
 
-    env = MazeEnv(render_mode='human')
+    # Same 4-frame stack as training; the vec env auto-resets when an episode ends
+    env = VecFrameStack(DummyVecEnv([lambda: MazeEnv(render_mode='human')]), 4)
     try:
-        obs, _ = env.reset()
+        obs = env.reset()
+        steps = 0
         while True:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, _ = env.step(action)
-            if terminated:
-                print(f"Goal reached in {env.step_count} steps!")
-                break
-            if truncated:
-                print(f"Failed: hit {env.max_steps}-step limit.")
+            obs, _, done, info = env.step(action)
+            steps += 1
+            if done[0]:
+                print(f"Goal reached in {steps} steps!" if info[0]["goal"]
+                      else f"Failed: ran out of time after {steps} steps.")
                 break
     finally:
         env.close()
