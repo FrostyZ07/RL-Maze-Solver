@@ -41,8 +41,8 @@ class MazeEnv(gym.Env):
         # Observation space:
         # [time_left, goal_visible, dist_to_target, sin(heading_error), cos(heading_error), lidar_1, ..., lidar_N]
         # time_left = fraction of the step budget remaining (1 -> 0)
-        # the three goal values are 0 unless the goal is in line of sight; 5 + 32 = 37
-        self.num_lidar_rays = 32
+        # the three goal values are 0 unless the goal is in line of sight; 5 + 8 = 13
+        self.num_lidar_rays = 8   # every 45 degrees
         self.lidar_range = 10.0
         obs_dim = 5 + self.num_lidar_rays
 

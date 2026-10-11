@@ -25,7 +25,7 @@ def train():
     env = VecFrameStack(DummyVecEnv([lambda: Monitor(env)]), 4)
 
     # ent_coef=0.01 is better for Discrete actions (max entropy is ~1.1)
-    # Always from scratch: obs size changed (37), old checkpoints are incompatible
+    # Always from scratch: obs size changed (13), old checkpoints are incompatible
     model = PPO("MlpPolicy", env, verbose=1, tensorboard_log=log_dir, device="cpu",
                 n_steps=2048, batch_size=64, gamma=0.99, ent_coef=0.03)
     
