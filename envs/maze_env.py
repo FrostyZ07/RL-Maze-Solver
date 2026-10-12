@@ -13,7 +13,8 @@ class MazeEnv(gym.Env):
     # Difficulty knobs (set NUM_OBSTACLES = 0 etc. to switch one off while debugging)
     MAZE_SIZE = 15          # odd; 15 -> 13x13 playable cells
     NUM_OBSTACLES = 2       # patrolling blocks
-    TIME_SLACK = 1.5        # episode budget = slack * estimated actions for the shortest route
+    TIME_SLACK = 4.0        # episode budget = slack * estimated actions for the shortest route (room to search for the hidden goal)
+    NOVELTY_BONUS = 0.1     # first visit to a tile; keep small so the +100 goal dominates
     WALL_PENALTY = 0.05
     OBSTACLE_PENALTY = 1.0
     LIDAR_NOISE = 0.05      # std (m) of Gaussian noise on each lidar reading
@@ -293,7 +294,7 @@ class MazeEnv(gym.Env):
         cell = self._cell(agent_pos)
         if cell not in self.visited:
             self.visited.add(cell)
-            reward += 0.5
+            reward += self.NOVELTY_BONUS
 
         terminated = False
         truncated = self.step_count >= self.max_steps
