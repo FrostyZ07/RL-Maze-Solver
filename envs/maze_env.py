@@ -13,8 +13,8 @@ class MazeEnv(gym.Env):
     # Difficulty knobs (set NUM_OBSTACLES = 0 etc. to switch one off while debugging)
     MAZE_SIZE = 15          # odd; 15 -> 13x13 playable cells
     NUM_OBSTACLES = 2       # patrolling blocks
-    TIME_SLACK = 1.5        # episode budget = slack * estimated actions for the shortest route
-    WALL_PENALTY = 0.05
+    TIME_SLACK = 2.0       # episode budget = slack * estimated actions for the shortest route
+    WALL_PENALTY = 0.1
     OBSTACLE_PENALTY = 1.0
 
     def __init__(self, render_mode=None):

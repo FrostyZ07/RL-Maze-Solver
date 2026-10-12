@@ -25,19 +25,29 @@ def train():
     env = VecFrameStack(DummyVecEnv([lambda: Monitor(env)]), 4)
 
     # ent_coef=0.01 is better for Discrete actions (max entropy is ~1.1)
-    model = PPO("MlpPolicy", env, verbose=1, tensorboard_log=log_dir, device="cpu",
-                n_steps=2048, batch_size=64, gamma=0.99, ent_coef=0.03)
-    
+    resume = os.path.exists("ppo_maze_final.zip")
+    if resume:
+        # Continue from the saved model (same hyperparameters are restored)
+        model = PPO.load("ppo_maze_final", env=env, device="cpu", tensorboard_log=log_dir)
+        ent_coef = 0.01
+    else:
+        model = PPO("MlpPolicy", env, verbose=1, tensorboard_log=log_dir, device="cpu",
+                    n_steps=2048, batch_size=64, gamma=0.99, ent_coef=0.01)
+
     # Checkpoint callback
     checkpoint_callback = CheckpointCallback(save_freq=10000, save_path=log_dir, name_prefix="ppo_maze")
     
     print("Starting training...")
     # Train
     # Short training for PoC, can be increased
-    total_timesteps = 500000 
-    model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback, tb_log_name="PPO_run")
-    
-    print("Training finished.")
+    total_timesteps = 300000
+    try:
+        model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback, tb_log_name="PPO_run",
+                    reset_num_timesteps=not resume)
+        print("Training finished.")
+    except KeyboardInterrupt:
+        # Ctrl+C: keep what was learned so far
+        print("Interrupted, saving current model.")
     
     # Save final model
     model.save("ppo_maze_final")

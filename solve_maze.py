@@ -21,15 +21,18 @@ def solve_maze():
     env = VecFrameStack(DummyVecEnv([lambda: MazeEnv(render_mode='human')]), 4)
     try:
         obs = env.reset()
-        steps = 0
-        while True:
-            action, _ = model.predict(obs, deterministic=True)
+        steps = successes = episodes = 0
+        while episodes < 10:
+            action, _ = model.predict(obs, deterministic=False)
             obs, _, done, info = env.step(action)
             steps += 1
             if done[0]:
+                episodes += 1
+                successes += bool(info[0]["goal"])
                 print(f"Goal reached in {steps} steps!" if info[0]["goal"]
-                      else f"Failed: ran out of time after {steps} steps.")
-                break
+                      else f"Failed: ran out of time after {steps} steps.",
+                      f"[{successes}/{episodes}]")
+                steps = 0
     finally:
         env.close()
 
