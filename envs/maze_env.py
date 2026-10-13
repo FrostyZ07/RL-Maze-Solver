@@ -67,6 +67,11 @@ class MazeEnv(gym.Env):
         self.layout = self._make_layout(self.size)
         self.segments = self._find_segments()
 
+    def set_size(self, size):
+        """Curriculum hook: takes effect on the next reset() (random-maze mode)."""
+        self.size = size
+        self.offset = -(size - 1) // 2
+
     def _make_layout(self, size, seed=0, loops=6):
         """DFS maze (long corridors + dead ends), then open a few walls to make loops."""
         rng = np.random.default_rng(seed)
