@@ -13,13 +13,18 @@ class MazeEnv(gym.Env):
     # Difficulty knobs (set NUM_OBSTACLES = 0 etc. to switch one off while debugging)
     MAZE_SIZE = 15          # odd; 15 -> 13x13 playable cells
     NUM_OBSTACLES = 2       # patrolling blocks
-    TIME_SLACK = 2.0       # episode budget = slack * estimated actions for the shortest route
-    WALL_PENALTY = 0.1
+    TIME_SLACK = 4.0        # episode budget = slack * estimated actions for the shortest route (room to search for the hidden goal)
+    NOVELTY_BONUS = 0.1     # first visit to a tile; keep small so the +100 goal dominates
+    REVISIT_PENALTY = 0.05  # re-entering an already visited tile (discourages loops)
+    WALL_PENALTY = 0.05
     OBSTACLE_PENALTY = 1.0
+    LIDAR_NOISE = 0.05      # std (m) of Gaussian noise on each lidar reading
+    ACTION_NOISE = 0.1      # std of relative error on forward/turn speed (wheel slip)
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, fixed=False):
         super(MazeEnv, self).__init__()
         self.render_mode = render_mode
+        self.fixed = fixed  # True: the seed-0 test maze, goal bottom-right; False: new maze + goal every episode
 
         # Connect to PyBullet
         if render_mode == 'human':
@@ -36,11 +41,14 @@ class MazeEnv(gym.Env):
         self.action_space = spaces.Discrete(3)
 
         # Observation space:
-        # [dist_to_target, sin(heading_error), cos(heading_error), lidar_1, ..., lidar_N]
-        # 3 + 32 = 35
-        self.num_lidar_rays = 32
+        # [time_left, goal_visible, dist_to_target, sin(heading_error), cos(heading_error),
+        #  visits ahead/left/behind/right, lidar_1, ..., lidar_N]
+        # time_left = fraction of the step budget remaining (1 -> 0)
+        # the three goal values are 0 unless the goal is in line of sight
+        # visits = how often the neighbouring tile was entered (odometry memory), 0..1; 5 + 4 + 8 = 17
+        self.num_lidar_rays = 8   # every 45 degrees
         self.lidar_range = 10.0
-        obs_dim = 3 + self.num_lidar_rays
+        obs_dim = 5 + 4 + self.num_lidar_rays
 
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
@@ -53,11 +61,16 @@ class MazeEnv(gym.Env):
         self.max_steps = 500  # overwritten per episode in reset()
         self.agent_radius = 0.15
 
-        # Fixed (seeded) layout: same maze every run, always solvable
+        # Seed-0 layout (the test maze when fixed=True; otherwise reset() regenerates it)
         self.size = self.MAZE_SIZE
         self.offset = -(self.size - 1) // 2   # tile (r, c) -> world (c + offset, r + offset)
         self.layout = self._make_layout(self.size)
         self.segments = self._find_segments()
+
+    def set_size(self, size):
+        """Curriculum hook: takes effect on the next reset() (random-maze mode)."""
+        self.size = size
+        self.offset = -(size - 1) // 2
 
     def _make_layout(self, size, seed=0, loops=6):
         """DFS maze (long corridors + dead ends), then open a few walls to make loops."""
@@ -142,6 +155,10 @@ class MazeEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
+        if not self.fixed:
+            self.layout = self._make_layout(self.size, seed=int(self.np_random.integers(2**31)))
+            self.segments = self._find_segments()
+
         p.resetSimulation()
         p.setGravity(0, 0, -9.8)
 
@@ -161,11 +178,18 @@ class MazeEnv(gym.Env):
                                                       baseVisualShapeIndex=wall_visual_shape,
                                                       basePosition=[col_idx + off, row_idx + off, 1]))
 
-        # Goal tile = bottom-right; start = random open tile far enough from it
-        gr, gc = self.size - 2, self.size - 2
-        open_cells = [(r, c) for r, row in enumerate(self.layout) for c, v in enumerate(row)
-                      if v == 0 and abs(r - gr) + abs(c - gc) >= self.size // 2]
-        r, c = open_cells[self.np_random.integers(len(open_cells))]
+        open_cells = [(r, c) for r, row in enumerate(self.layout) for c, v in enumerate(row) if v == 0]
+        far = self.size // 2
+        if self.fixed:
+            # goal bottom-right; start = random open tile far enough from it
+            gr, gc = self.size - 2, self.size - 2
+            starts = [(r, c) for r, c in open_cells if abs(r - gr) + abs(c - gc) >= far]
+            r, c = starts[self.np_random.integers(len(starts))]
+        else:
+            r, c = open_cells[self.np_random.integers(len(open_cells))]
+            goals = [(a, b) for a, b in open_cells if abs(a - r) + abs(b - c) >= far]
+            gr, gc = goals[self.np_random.integers(len(goals))]
+        self.goal_cell = (gr, gc)
         agent_start_pos = [c + off, r + off, 0.5]
         self.max_steps = self._route_budget((r, c), (gr, gc))
 
@@ -204,6 +228,7 @@ class MazeEnv(gym.Env):
             self._move_obstacles(0.0)
 
         # Goal
+        gr, gc = self.goal_cell
         goal_pos = [gc + off, gr + off, 0.5]
         goal_visual = p.createVisualShape(p.GEOM_SPHERE, radius=0.5, rgbaColor=[0, 1, 0, 1])
         self.goal_id = p.createMultiBody(baseMass=0, baseVisualShapeIndex=goal_visual, basePosition=goal_pos)
@@ -216,7 +241,8 @@ class MazeEnv(gym.Env):
             p.resetDebugVisualizerCamera(cameraDistance=1.3 * self.size, cameraYaw=0, cameraPitch=-89, cameraTargetPosition=[0, 0, 0])
 
         self.step_count = 0
-        self.visited = {self._cell(agent_start_pos[:2])}
+        self.last_cell = self._cell(agent_start_pos[:2])
+        self.visits = {self.last_cell: 1}  # tile -> times entered
         return self._get_obs(), {}
 
     @staticmethod
@@ -252,6 +278,10 @@ class MazeEnv(gym.Env):
         euler = p.getEulerFromQuaternion(orn)
         yaw = euler[2]
 
+        # Movement noise: the commanded speed is never exactly what you get
+        forward_speed *= 1 + self.ACTION_NOISE * self.np_random.standard_normal()
+        turn_speed *= 1 + self.ACTION_NOISE * self.np_random.standard_normal()
+
         vx = forward_speed * np.cos(yaw)
         vy = forward_speed * np.sin(yaw)
 
@@ -263,17 +293,20 @@ class MazeEnv(gym.Env):
         if self.render_mode == 'human':
             time.sleep(1./30.)
 
-        obs = self._get_obs()
-
         # Event-based reward only: no distance/heading shaping, no path hints.
+        pos = p.getBasePositionAndOrientation(self.agent_id)[0]
         agent_pos = np.array(pos[:2])
         reward = -0.01  # step penalty
 
-        # First-visit novelty bonus (exploration signal, needs no map knowledge)
+        # Entering a tile: bonus the first time, small penalty when coming back (needs no map knowledge)
         cell = self._cell(agent_pos)
-        if cell not in self.visited:
-            self.visited.add(cell)
-            reward += 0.5
+        if cell != self.last_cell:
+            self.last_cell = cell
+            n = self.visits.get(cell, 0)
+            self.visits[cell] = n + 1
+            reward += self.NOVELTY_BONUS if n == 0 else -self.REVISIT_PENALTY
+
+        obs = self._get_obs()
 
         terminated = False
         truncated = self.step_count >= self.max_steps
@@ -295,11 +328,18 @@ class MazeEnv(gym.Env):
         if hit_obstacle:
             reward -= self.OBSTACLE_PENALTY
 
-        # Debug Draw
-        if self.render_mode == 'human':
-             p.addUserDebugLine([agent_pos[0], agent_pos[1], 0.5], [self.target_pos[0], self.target_pos[1], 0.5], [0, 1, 1], lifeTime=0.1)
-
         return obs, reward, terminated, truncated, {"goal": terminated}
+
+    def _goal_visible(self, pos):
+        """Line of sight to the goal: the goal sphere has no collision shape, so a clear ray means no wall/obstacle between."""
+        d = self.goal_pos - np.array(pos[:2])
+        dist = np.linalg.norm(d)
+        r0 = self.agent_radius + 0.01  # start outside own body
+        if dist <= r0:
+            return True
+        u = d / dist
+        ray_from = [pos[0] + r0 * u[0], pos[1] + r0 * u[1], 0.5]
+        return p.rayTest(ray_from, [self.goal_pos[0], self.goal_pos[1], 0.5])[0][0] == -1
 
     def _get_obs(self):
         pos, orn = p.getBasePositionAndOrientation(self.agent_id)
@@ -309,16 +349,13 @@ class MazeEnv(gym.Env):
         agent_pos = np.array(pos[:2])
         target_pos = self.target_pos
 
-        # Relative State
-        dist_to_target = np.linalg.norm(agent_pos - target_pos)
-
-        dx = target_pos[0] - agent_pos[0]
-        dy = target_pos[1] - agent_pos[1]
-        angle_to_target = math.atan2(dy, dx)
-        heading_error = angle_to_target - yaw
-
-        sin_heading = np.sin(heading_error)
-        cos_heading = np.cos(heading_error)
+        # Relative goal state, only while the goal is in line of sight (else zeros)
+        goal_obs = [0.0, 0.0, 0.0, 0.0]
+        if self._goal_visible(pos):
+            dx = target_pos[0] - agent_pos[0]
+            dy = target_pos[1] - agent_pos[1]
+            heading_error = math.atan2(dy, dx) - yaw
+            goal_obs = [1.0, np.hypot(dx, dy), np.sin(heading_error), np.cos(heading_error)]
 
         # Lidar
         lidar_readings = []
@@ -330,8 +367,21 @@ class MazeEnv(gym.Env):
             ray_to = [pos[0] + self.lidar_range * c, pos[1] + self.lidar_range * s, pos[2]]
             hit_fraction = p.rayTest(ray_from, ray_to)[0][2]
             lidar_readings.append(r0 + hit_fraction * (self.lidar_range - r0))
+        # Sensor noise
+        lidar_readings = np.clip(np.array(lidar_readings)
+                                 + self.LIDAR_NOISE * self.np_random.standard_normal(self.num_lidar_rays),
+                                 0.0, self.lidar_range)
 
-        obs = np.concatenate([[dist_to_target, sin_heading, cos_heading], lidar_readings])
+        # Visit counts of the 4 neighbouring tiles relative to heading: ahead, left, behind, right
+        cx, cy = self._cell(agent_pos)
+        visits = []
+        for k in range(4):
+            a = yaw + k * np.pi / 2
+            n = self.visits.get((cx + int(round(np.cos(a))), cy + int(round(np.sin(a)))), 0)
+            visits.append(min(n, 3) / 3)
+
+        time_left = 1.0 - self.step_count / self.max_steps
+        obs = np.concatenate([[time_left], goal_obs, visits, lidar_readings])
         return obs.astype(np.float32)
 
     def close(self):

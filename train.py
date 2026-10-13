@@ -1,54 +1,69 @@
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack
 import os
 import time
 from envs.maze_env import MazeEnv
+
+N_ENVS = 8
+SIZES = [7, 9, 11, 13, 15]  # curriculum: maze size per level
+PROMOTE_AT = 0.6            # recent success rate needed to move up
+
+class Curriculum(BaseCallback):
+    """Grow the maze once the agent wins >= PROMOTE_AT of its last 100 episodes."""
+    def __init__(self):
+        super().__init__()
+        self.level = 0
+
+    def _on_training_start(self):
+        self.training_env.env_method("set_size", SIZES[0])
+
+    def _on_step(self):
+        return True
+
+    def _on_rollout_end(self):
+        buf = self.model.ep_info_buffer
+        if self.level < len(SIZES) - 1 and len(buf) >= 100 and sum(e["goal"] for e in buf) / len(buf) >= PROMOTE_AT:
+            self.level += 1
+            self.training_env.env_method("set_size", SIZES[self.level])
+            buf.clear()
+            print(f"Curriculum: maze size -> {SIZES[self.level]}")
+
+def make_env():
+    # each subprocess gets its own PyBullet connection; Monitor records ep_rew_mean / ep_len_mean
+    return Monitor(MazeEnv(render_mode=None), info_keywords=("goal",))
 
 def train():
     # Create log dir
     log_dir = "logs/"
     os.makedirs(log_dir, exist_ok=True)
-    
-    # Initialize environment
-    env = MazeEnv(render_mode=None) # No GUI for training speed
-    
-    # Check if environment follows Gym API
-    check_env(env)
 
-    # Stack the last 4 lidar frames so the agent can perceive obstacle motion
-    # (same env instance: PyBullet module calls share one default client)
-    # Monitor records episode reward/length -> rollout/ep_rew_mean, ep_len_mean in the logs
-    env = VecFrameStack(DummyVecEnv([lambda: Monitor(env)]), 4)
+    # Check if environment follows Gym API (separate throwaway instance)
+    check_env(MazeEnv(render_mode=None))
 
-    # ent_coef=0.01 is better for Discrete actions (max entropy is ~1.1)
-    resume = os.path.exists("ppo_maze_final.zip")
-    if resume:
-        # Continue from the saved model (same hyperparameters are restored)
-        model = PPO.load("ppo_maze_final", env=env, device="cpu", tensorboard_log=log_dir)
-        ent_coef = 0.01
-    else:
-        model = PPO("MlpPolicy", env, verbose=1, tensorboard_log=log_dir, device="cpu",
-                    n_steps=2048, batch_size=64, gamma=0.99, ent_coef=0.01)
+    # 8 parallel envs, each a new random maze + goal every episode; stack the last 4 frames
+    env = VecFrameStack(SubprocVecEnv([make_env] * N_ENVS), 4)
 
-    # Checkpoint callback
-    checkpoint_callback = CheckpointCallback(save_freq=10000, save_path=log_dir, name_prefix="ppo_maze")
-    
+    # Always from scratch: obs size changed (17), old checkpoints are incompatible
+    # n_steps is per env: 8 * 512 = 4096 samples per update
+    model = PPO("MlpPolicy", env, verbose=1, tensorboard_log=log_dir, device="cpu",
+                n_steps=512, batch_size=256, gamma=0.995, ent_coef=0.01,
+                policy_kwargs=dict(net_arch=[256, 256]))
+
+    # Checkpoint callback (save_freq counts per-env steps)
+    checkpoint_callback = CheckpointCallback(save_freq=10000 // N_ENVS, save_path=log_dir, name_prefix="ppo_maze")
+
     print("Starting training...")
-    # Train
-    # Short training for PoC, can be increased
-    total_timesteps = 300000
+    total_timesteps = 5_000_000
     try:
-        model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback, tb_log_name="PPO_run",
-                    reset_num_timesteps=not resume)
+        model.learn(total_timesteps=total_timesteps, callback=[checkpoint_callback, Curriculum()], tb_log_name="PPO_run")
         print("Training finished.")
     except KeyboardInterrupt:
-        # Ctrl+C: keep what was learned so far
         print("Interrupted, saving current model.")
-    
+
     # Save final model
     model.save("ppo_maze_final")
     env.close()
