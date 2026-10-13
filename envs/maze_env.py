@@ -15,6 +15,7 @@ class MazeEnv(gym.Env):
     NUM_OBSTACLES = 2       # patrolling blocks
     TIME_SLACK = 4.0        # episode budget = slack * estimated actions for the shortest route (room to search for the hidden goal)
     NOVELTY_BONUS = 0.1     # first visit to a tile; keep small so the +100 goal dominates
+    REVISIT_PENALTY = 0.05  # re-entering an already visited tile (discourages loops)
     WALL_PENALTY = 0.05
     OBSTACLE_PENALTY = 1.0
     LIDAR_NOISE = 0.05      # std (m) of Gaussian noise on each lidar reading
@@ -40,12 +41,14 @@ class MazeEnv(gym.Env):
         self.action_space = spaces.Discrete(3)
 
         # Observation space:
-        # [time_left, goal_visible, dist_to_target, sin(heading_error), cos(heading_error), lidar_1, ..., lidar_N]
+        # [time_left, goal_visible, dist_to_target, sin(heading_error), cos(heading_error),
+        #  visits ahead/left/behind/right, lidar_1, ..., lidar_N]
         # time_left = fraction of the step budget remaining (1 -> 0)
-        # the three goal values are 0 unless the goal is in line of sight; 5 + 8 = 13
+        # the three goal values are 0 unless the goal is in line of sight
+        # visits = how often the neighbouring tile was entered (odometry memory), 0..1; 5 + 4 + 8 = 17
         self.num_lidar_rays = 8   # every 45 degrees
         self.lidar_range = 10.0
-        obs_dim = 5 + self.num_lidar_rays
+        obs_dim = 5 + 4 + self.num_lidar_rays
 
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
@@ -233,7 +236,8 @@ class MazeEnv(gym.Env):
             p.resetDebugVisualizerCamera(cameraDistance=1.3 * self.size, cameraYaw=0, cameraPitch=-89, cameraTargetPosition=[0, 0, 0])
 
         self.step_count = 0
-        self.visited = {self._cell(agent_start_pos[:2])}
+        self.last_cell = self._cell(agent_start_pos[:2])
+        self.visits = {self.last_cell: 1}  # tile -> times entered
         return self._get_obs(), {}
 
     @staticmethod
@@ -284,17 +288,20 @@ class MazeEnv(gym.Env):
         if self.render_mode == 'human':
             time.sleep(1./30.)
 
-        obs = self._get_obs()
-
         # Event-based reward only: no distance/heading shaping, no path hints.
+        pos = p.getBasePositionAndOrientation(self.agent_id)[0]
         agent_pos = np.array(pos[:2])
         reward = -0.01  # step penalty
 
-        # First-visit novelty bonus (exploration signal, needs no map knowledge)
+        # Entering a tile: bonus the first time, small penalty when coming back (needs no map knowledge)
         cell = self._cell(agent_pos)
-        if cell not in self.visited:
-            self.visited.add(cell)
-            reward += self.NOVELTY_BONUS
+        if cell != self.last_cell:
+            self.last_cell = cell
+            n = self.visits.get(cell, 0)
+            self.visits[cell] = n + 1
+            reward += self.NOVELTY_BONUS if n == 0 else -self.REVISIT_PENALTY
+
+        obs = self._get_obs()
 
         terminated = False
         truncated = self.step_count >= self.max_steps
@@ -360,8 +367,16 @@ class MazeEnv(gym.Env):
                                  + self.LIDAR_NOISE * self.np_random.standard_normal(self.num_lidar_rays),
                                  0.0, self.lidar_range)
 
+        # Visit counts of the 4 neighbouring tiles relative to heading: ahead, left, behind, right
+        cx, cy = self._cell(agent_pos)
+        visits = []
+        for k in range(4):
+            a = yaw + k * np.pi / 2
+            n = self.visits.get((cx + int(round(np.cos(a))), cy + int(round(np.sin(a)))), 0)
+            visits.append(min(n, 3) / 3)
+
         time_left = 1.0 - self.step_count / self.max_steps
-        obs = np.concatenate([[time_left], goal_obs, lidar_readings])
+        obs = np.concatenate([[time_left], goal_obs, visits, lidar_readings])
         return obs.astype(np.float32)
 
     def close(self):
