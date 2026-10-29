@@ -221,3 +221,215 @@ Remember: RL is random. A different run of the *same* settings can differ. If yo
 - **Advantage:** "was that action better than expected?"
 - **Entropy:** how random the choices are (max 1.0986 with 3 actions).
 - **Deterministic:** in `solve_maze.py` the agent always picks its most likely action, with no dice, so it's a clean replay of what it learned.
+
+---
+
+# Part 2: Everything added after the first version (evaluation, map memory, tests)
+
+Sections 1-10 above describe the original project. This part records every change made since, so you can follow how the project grew and re-run all of it. Where this part and sections 1-10 disagree (for example the observation size, the episode budget, `PROMOTE_AT`), this part is current.
+
+## 11. What changed, file by file
+
+### `envs/maze_env.py` (the world)
+
+| Change | What it does | Why |
+|---|---|---|
+| `EVAL_SEED_RANGE = 2**20` | Training layout seeds come from `[2**20, 2**31)`; evaluation seeds from `[0, 2**20)` | Test mazes are never seen in training, so a score measures generalisation |
+| `reset(seed, options={"size", "layout_seed"})` | Pins one episode (maze size and layout) | Lets `evaluate.py` replay exactly the same mazes every time |
+| `size=` constructor argument | `MazeEnv(size=7)` / `gym.make("MazeNav-v0", size=7)` | Tests and curriculum can start at any size |
+| `LOOPS = 6`, `_make_layout(..., loops=None)` | Number of extra walls opened after the DFS maze | Loops make the maze less of a pure tree |
+| `_time_budget(size)`, `STEPS_PER_TILE = 15` | Episode limit = 15 x number of open tiles, from the maze size only | The old budget came from the start-goal route, so `time_left` leaked how far the hidden goal was |
+| `get_pose()`, `start_cell`, `goal_cell`, `layout_seed` | Public state used by the agents and tests | Oracle / Frontier / tests need the pose without touching PyBullet internals |
+| `_bfs(start, passable, is_goal)` | One generic breadth-first search | `shortest_path()` (true layout) and `_route()` (own map) share it |
+| Own map `known` | `size x size` array: -1 unknown, 0 open, 1 wall. Built from the 8 noisy lidar rays plus 4 world-axis scan rays and odometry | This is the memory. It is built only from what the sensors return, never from the true layout |
+| `wall_tile` | Body id to tile, so a lidar hit on a wall says which tile is a wall | Exact wall marking, no guessing at corners |
+| `searched` | Tiles the goal is ruled out from: visited tiles, and tiles on the clear stretch of the agent's own row/column while the goal was not visible | Without it the agent can map the whole maze, never have the goal in line of sight, and stop (this was the cause of the first 94% result) |
+| `goal_seen_cell` | Remembers where the goal was last seen | Route cue can lead back to it after losing sight |
+| `_route()` / `waypoint()` | BFS over the known map to the remembered goal, else to the nearest tile with an unknown neighbour or not yet searched | The route cue |
+| `_crop()` | 7x7 window of `known` around the agent, rotated to the nearest 90 degree heading | Map picture the network can read |
+| Out-of-maze guard | If physics knocks the agent outside the maze, mapping is skipped and the route is `None` | Found by a smoke training run (`IndexError` in a worker); has a regression test |
+
+**Observation is now 70 numbers** (was 17):
+
+| Index | Meaning |
+|---|---|
+| 0 | `time_left` (1 -> 0) |
+| 1-4 | goal visible, distance, sin, cos of heading error (zeros unless in line of sight) |
+| 5-8 | visit counts of the 4 neighbour tiles (ahead, left, behind, right) |
+| 9-16 | 8 noisy lidar readings |
+| 17-20 | route cue: has target, path length / size, sin, cos of heading error to the next tile |
+| 21-69 | 7x7 map crop, +1 open, 0 unknown, -1 wall or outside |
+
+Indices 0-16 did not move, so older helper code that slices `obs[9:17]` for lidar still works.
+
+Reward is unchanged (novelty, revisit, wall, obstacle, step penalties, +100 goal).
+
+### `train.py`
+- `argparse`: `--seed`, `--timesteps`, `--resume`.
+- `gym.make("MazeNav-v0")` instead of importing `MazeEnv` directly (registered in `envs/__init__.py`).
+- `Curriculum` stores the level on the model (`model.curriculum_level`); SB3 pickles it into every checkpoint, so `--resume` continues at the same maze size.
+- `PROMOTE_AT` raised **0.6 -> 0.9**: the maze only grows once the agent wins 90% of its last 100 episodes.
+- `reset_num_timesteps=resume is None`, so a resumed run adds `--timesteps` on top of the saved count.
+
+### `evaluate.py` (fixed evaluation set)
+- 5 maze sizes x 200 seeded held-out mazes by default. `episode_seed = base + size*10000 + i`.
+- Agents:
+
+| Agent | What it knows | Role |
+|---|---|---|
+| `RandomAgent` | nothing | floor |
+| `NodeCountAgent` | odometry + lidar, no map | classic map-free explorer (visits least-visited neighbour) |
+| `FrontierAgent` | its own map (same sensors as PPO) | proves the memory is enough: follows the route cue |
+| `OracleAgent` | true layout and goal (cheats) | upper reference |
+| `PPOAgent` | the observation, 4-frame stack identical to `VecFrameStack` | the trained model |
+
+- Reports success rate with Wilson 95% confidence interval, steps, SPL (path efficiency, 1.0 = shortest route), obstacle hits. Several `--models` also give a bootstrap mean row.
+
+### `envs/__init__.py`
+Registers `MazeNav-v0`. No `max_episode_steps`: the env truncates itself.
+
+### `requirements.txt`
+Versions pinned (`gymnasium==1.4.0`, `stable-baselines3[extra]==2.9.0`, `pybullet==3.2.7`, `torch==2.14.1+cpu`, ...). CPU torch comes from `--extra-index-url`. Python 3.12 (`.python-version`).
+
+### `.gitignore`
+Now also ignores `results/`, `.venv/`, `__pycache__/` (plus `logs/`, `ppo_maze_final.zip` as before).
+
+### `tests/` and `conftest.py`
+`conftest.py` puts the repo root on `sys.path`. 26 tests in total:
+
+| File | Covers |
+|---|---|
+| `tests/test_env.py` | spaces (70-dim), `check_env`, same seed gives same episode, budget independent of route, budget scales with size, train/eval seeds held out, every maze solvable, fixed mode, curriculum level survives save/load, **own map never contradicts the layout**, **route cue exists until fully explored**, **agent knocked outside the maze does not crash** |
+| `tests/test_eval.py` | Wilson CI values, unique held-out seeds, reproducible episodes, agents return well-formed rows, **FrontierAgent solves 40/40 (sizes 7 and 15)**, PPOAgent stacking matches `VecFrameStack` |
+
+### `CLAUDE.md`
+Updated for the 70-dim observation, `FrontierAgent`, and the warning that old checkpoints no longer load.
+
+## 12. The memory idea in plain words
+
+Before: the agent only knew how many times it had entered the 4 tiles around it (plus the last 4 frames). In a maze with loops that is not enough to be sure it has tried everywhere, so it wandered.
+
+Now it draws its own map as it moves and gets two things from it:
+
+1. **A picture:** the 7x7 crop around it (open / wall / unknown).
+2. **A hint:** the direction of the next step toward the goal if it has seen it, otherwise toward the nearest place it has not explored or ruled out.
+
+The hint is plain breadth-first search over the agent's own map, so the information in the observation is enough to solve every maze. The `FrontierAgent` shows that: it only follows the hint and solves essentially all of them. PPO still has to learn to use it, so 100% for PPO is a target, not a guarantee.
+
+Honesty rules for the map: it uses noisy lidar readings, never the true layout; patrolling blocks are not walls; a tile is never overwritten once known.
+
+## 13. All commands
+
+Run everything from the repo root (`D:\Saved\RL\RL-Maze-Solver`). The scripts import `envs.maze_env`, and `app.py` starts `train.py` with a relative path.
+
+### Activate the virtual environment
+```
+.\.venv\Scripts\Activate.ps1        # PowerShell
+.venv\Scripts\activate.bat          # cmd
+source .venv/Scripts/activate       # Git Bash
+deactivate                          # leave it
+```
+Without activating, use `.\.venv\Scripts\python.exe` in place of `python`. If PowerShell refuses: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
+### Install
+```
+pip install -r requirements.txt
+```
+pybullet has no Windows wheel; installing it there needs the MSVC C++ Build Tools.
+
+### `train.py`
+| Flag | Meaning | Default |
+|---|---|---|
+| `--seed N` | seeds PPO, torch and the 8 envs | 0 |
+| `--timesteps N` | steps to train; with `--resume` they are added on top | 5,000,000 |
+| `--resume ZIP` | continue from a checkpoint (weights, optimiser state, curriculum level) | none |
+
+```
+python train.py
+python train.py --seed 1 --timesteps 2000000
+python train.py --resume logs/ppo_maze_100000_steps.zip --timesteps 500000
+```
+Outputs: checkpoint every 10k steps to `logs/ppo_maze_<N>_steps.zip`; TensorBoard data in `logs/PPO_run_N`; final model `ppo_maze_final.zip` in the repo root. Ctrl+C saves the current model. 8 parallel workers, no GUI.
+
+Watch it: `tensorboard --logdir logs` then http://localhost:6006. Primary signals are `rollout/ep_rew_mean` up and `rollout/ep_len_mean` down; the console prints `Curriculum: maze size -> N` when it levels up.
+
+### `evaluate.py`
+| Flag | Meaning | Default |
+|---|---|---|
+| `--episodes N` | episodes per maze size | 200 |
+| `--sizes 7 9 ...` | maze sizes | 7 9 11 13 15 |
+| `--base-seed N` | offset for the eval seeds (must stay below `2**20`) | 0 |
+| `--models a.zip b.zip` | PPO checkpoints to score | `ppo_maze_final.zip`, else newest `logs/*.zip` |
+| `--deterministic` | PPO takes its most likely action instead of sampling | off (samples) |
+| `--agents ...` | any of `random nodecount frontier oracle ppo` | all five |
+| `--fixed` | the seed-0 test maze instead of seeded random mazes | off |
+| `--out DIR` | where the result files go | `results` |
+
+```
+python evaluate.py
+python evaluate.py --agents frontier oracle --episodes 200
+python evaluate.py --models a.zip b.zip --sizes 11 15 --episodes 50 --deterministic
+python evaluate.py --agents ppo --models logs/ppo_maze_500000_steps.zip
+```
+
+**Where the results go:** `results/eval_<timestamp>.csv` (one row per episode: agent, size, seed, success, steps, spl, shortest, path_len, obstacle_hits) and `results/eval_<timestamp>.json` (the config, library versions, and the summary table with confidence intervals). `results/` is git-ignored. Runs made while developing this feature used `--out` pointing at a temporary folder, so only `results/eval_20261017_145657.*` (the old model, 17-dim era) is in the repo; do not compare new runs against it.
+
+### Other scripts
+```
+python app.py           # Flask dashboard http://localhost:5000, starts TensorBoard on :6006; Start/Stop buttons run train.py
+python test_agent.py    # GUI rollout of the newest logs/*.zip (stale: no frame stack, wrong obs print)
+python solve_maze.py    # GUI demo of the PPO model on random mazes
+```
+
+### Tests
+```
+pytest tests/
+pytest tests/test_env.py::test_spaces
+pytest tests/test_eval.py -q
+```
+About 35 seconds for all 26.
+
+## 14. Results so far
+
+All numbers are on held-out mazes (seeds below `2**20`), success rate.
+
+**Before the map memory** (`results/eval_20261017_145657.json`, 200 episodes per size, 17-dim observation):
+
+| Agent | 7 | 9 | 11 | 13 | 15 | all |
+|---|---|---|---|---|---|---|
+| Random | 23.5% | 25.5% | 17.5% | 12.0% | 7.5% | 17.2% |
+| NodeCount (no map) | 98.5% | 97.0% | 95.5% | 91.0% | 88.5% | 94.1% |
+| Oracle (cheats) | 100% | 100% | 100% | 100% | 100% | 100% |
+| PPO (`ppo_maze_parallel`, old env) | 93.5% | 85.0% | 71.0% | 62.5% | 46.5% | 71.7% |
+
+**After the map memory** (200 episodes per size, new env), `FrontierAgent`:
+
+| Size | 7 | 9 | 11 | 13 | 15 | all |
+|---|---|---|---|---|---|---|
+| Success | 100% | 99.5% | 100% | 100% | 100% | **99.9%** (999/1000, CI 99.4-100%) |
+| Mean steps when it wins | 74 | 117 | 206 | 321 | 494 | 242 |
+| SPL | 0.77 | 0.72 | 0.63 | 0.58 | 0.52 | 0.64 |
+
+How it got there: the first version of the route cue (visit unknown neighbours only) scored 94% because it finished mapping without ever getting the goal in line of sight and then had nothing left to do. Adding the `searched` set (rule out tiles the goal would have been visible from) took it to 100% on a 100-episode check and 99.9% on the full set. The one miss is a size-9 maze (a seed in `90000-90199`); not yet diagnosed, likely a patrolling block jamming a corridor.
+
+**PPO on the new observation: not trained yet.** Old checkpoints (`ppo_maze_old_final.zip`, `ppo_maze_parallel.zip`, anything in `logs/`) were trained on 17 numbers and cannot load into the 70-number env. After training, run `python evaluate.py` and compare PPO to the Frontier row: the closer PPO gets to Frontier, the better it learned to use its memory.
+
+## 15. Gotchas (new ones)
+
+- **One env per process.** `MazeEnv` talks to PyBullet's default client. Tests and evaluation create and close envs one at a time; training uses subprocesses.
+- **Retrain after any observation change.** The network's input size is baked into the checkpoint.
+- **A short smoke run leaves log folders.** Each `python train.py` creates `logs/PPO_run_N`, even if it crashes; delete empty ones.
+- **No learned policy is guaranteed 100%.** The Frontier row is the proof that the information is sufficient; PPO is measured against it.
+- **Extra scan rays.** Besides the 8 lidar rays in the observation, the map builder casts 4 world-axis rays (with the same noise) so tile neighbours get revealed regardless of heading.
+- **Slightly slower steps.** Map update plus BFS each step adds a little CPU time per environment step.
+
+- **Resizing waits for the next episode.** The curriculum calls `set_size` while episodes are running. It now only sets `env.next_size`; `reset()` applies it (`env.size`, `env.offset`, map arrays). Doing it immediately crashed all workers with `IndexError` at the first level-up (found at ~80k steps); regression test `test_resizing_mid_episode_waits_for_the_next_reset`.
+
+## 16. Experiments to try next (one change at a time)
+
+1. Train PPO on the new env and compare to Frontier per size.
+2. Try `PROMOTE_AT` 0.8 vs 0.9: faster levels vs. a more solid base at each size.
+3. Remove the route cue (keep only the crop) and see how much of the gain came from the hint versus the picture.
+4. Remove the crop (keep only the cue) for the opposite comparison.
+5. Debug the single Frontier failure (size 9, seeds `90000-90199`) with a patrolling-block-aware route.
+6. Evaluate several training seeds with `--models a.zip b.zip ...` to get the bootstrap mean row.

@@ -7,21 +7,28 @@ import time
 import math
 from collections import deque
 
+# Maze layouts come from a seed. Training draws layout seeds >= EVAL_SEED_RANGE; evaluation uses
+# seeds below it, so test mazes are never seen in training.
+EVAL_SEED_RANGE = 2**20
+
 class MazeEnv(gym.Env):
     metadata = {'render_modes': ['human', 'rgb_array']}
 
     # Difficulty knobs (set NUM_OBSTACLES = 0 etc. to switch one off while debugging)
     MAZE_SIZE = 15          # odd; 15 -> 13x13 playable cells
     NUM_OBSTACLES = 2       # patrolling blocks
-    TIME_SLACK = 4.0        # episode budget = slack * estimated actions for the shortest route (room to search for the hidden goal)
+    LOOPS = 6               # extra walls opened after the DFS maze, to create loops
+    STEPS_PER_TILE = 15     # episode budget = this * open tiles; depends on maze size only, so time_left carries no route-length hint
     NOVELTY_BONUS = 0.1     # first visit to a tile; keep small so the +100 goal dominates
     REVISIT_PENALTY = 0.05  # re-entering an already visited tile (discourages loops)
     WALL_PENALTY = 0.05
     OBSTACLE_PENALTY = 1.0
     LIDAR_NOISE = 0.05      # std (m) of Gaussian noise on each lidar reading
     ACTION_NOISE = 0.1      # std of relative error on forward/turn speed (wheel slip)
+    CROP = 7                # side (tiles) of the egocentric map window in the observation
+    CARDINALS = ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0))  # world axes; extra scan rays used only to map
 
-    def __init__(self, render_mode=None, fixed=False):
+    def __init__(self, render_mode=None, fixed=False, size=None):
         super(MazeEnv, self).__init__()
         self.render_mode = render_mode
         self.fixed = fixed  # True: the seed-0 test maze, goal bottom-right; False: new maze + goal every episode
@@ -46,9 +53,13 @@ class MazeEnv(gym.Env):
         # time_left = fraction of the step budget remaining (1 -> 0)
         # the three goal values are 0 unless the goal is in line of sight
         # visits = how often the neighbouring tile was entered (odometry memory), 0..1; 5 + 4 + 8 = 17
+        # then, from the agent's own map (built from lidar + odometry, never from the true layout):
+        #  [has_target, path_len/size, sin, cos] to the next tile on the BFS route to the remembered goal
+        #  (or, before the goal was seen, to the nearest unexplored tile), then a 7x7 egocentric crop of the map
+        #  (+1 open, 0 unknown, -1 wall/outside), axis-aligned to the nearest heading; 17 + 4 + 49 = 70
         self.num_lidar_rays = 8   # every 45 degrees
         self.lidar_range = 10.0
-        obs_dim = 5 + 4 + self.num_lidar_rays
+        obs_dim = 5 + 4 + self.num_lidar_rays + 4 + self.CROP * self.CROP
 
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
@@ -62,17 +73,21 @@ class MazeEnv(gym.Env):
         self.agent_radius = 0.15
 
         # Seed-0 layout (the test maze when fixed=True; otherwise reset() regenerates it)
-        self.size = self.MAZE_SIZE
+        self.size = size or self.MAZE_SIZE
+        self.next_size = self.size
         self.offset = -(self.size - 1) // 2   # tile (r, c) -> world (c + offset, r + offset)
-        self.layout = self._make_layout(self.size)
+        self.layout_seed = 0
+        self.layout = self._make_layout(self.size, seed=0)
         self.segments = self._find_segments()
+        self.start_cell = self.goal_cell = None
 
     def set_size(self, size):
-        """Curriculum hook: takes effect on the next reset() (random-maze mode)."""
-        self.size = size
-        self.offset = -(size - 1) // 2
+        """Curriculum hook: takes effect on the next reset(). The running episode keeps its maze, offset and
+        map, which are all sized for it; `next_size` is what the next episode will use."""
+        self.next_size = size
 
-    def _make_layout(self, size, seed=0, loops=6):
+    def _make_layout(self, size, seed=0, loops=None):
+        loops = self.LOOPS if loops is None else loops
         """DFS maze (long corridors + dead ends), then open a few walls to make loops."""
         rng = np.random.default_rng(seed)
         grid = [[1] * size for _ in range(size)]
@@ -129,35 +144,67 @@ class MazeEnv(gym.Env):
                     r += 1
         return segs
 
-    def _route_budget(self, start, goal):
-        """Episode step limit from the shortest route: ~6 actions per tile, ~9 per 90-degree turn."""
+    @staticmethod
+    def _bfs(start, passable, is_goal):
+        """BFS over 4-connected tiles: list of (r, c) from start to the nearest tile with is_goal, or None."""
         prev = {start: None}
         q = deque([start])
+        found = None
         while q:
             cur = q.popleft()
-            if cur == goal:
+            if is_goal(cur):
+                found = cur
                 break
             for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 n = (cur[0] + dr, cur[1] + dc)
-                if self.layout[n[0]][n[1]] == 0 and n not in prev:
+                if n not in prev and passable(n):
                     prev[n] = cur
                     q.append(n)
+        if found is None:
+            return None
         path = []
-        cur = goal
-        while cur is not None:
-            path.append(cur)
-            cur = prev[cur]
+        while found is not None:
+            path.append(found)
+            found = prev[found]
         path.reverse()
-        turns = sum(1 for a, b, c in zip(path, path[1:], path[2:])
-                    if (b[0] - a[0], b[1] - a[1]) != (c[0] - b[0], c[1] - b[1]))
-        return int(self.TIME_SLACK * (6 * (len(path) - 1) + 9 * turns))
+        return path
+
+    def shortest_path(self, start, goal):
+        """BFS over open tiles of the true layout: list of (r, c) from start to goal inclusive, or None."""
+        return self._bfs(start, lambda n: self.layout[n[0]][n[1]] == 0, lambda n: n == goal)
+
+    def _time_budget(self, size):
+        """Episode step limit from the maze size alone (open tiles of a DFS maze plus loops),
+        never from the start-goal route, so time_left cannot reveal how far the hidden goal is."""
+        k = (size - 1) // 2
+        spanning = k * k - 1                      # passages of the DFS spanning tree
+        possible = 2 * k * (k - 1)                # all wall tiles between two cells
+        open_tiles = k * k + spanning + min(self.LOOPS, possible - spanning)
+        return self.STEPS_PER_TILE * open_tiles
+
+    def get_pose(self):
+        """(xy position, yaw) of the agent."""
+        pos, orn = p.getBasePositionAndOrientation(self.agent_id)
+        return np.array(pos[:2]), p.getEulerFromQuaternion(orn)[2]
 
     def reset(self, seed=None, options=None):
+        """options (all optional): {"size": maze size, "layout_seed": int}. Evaluation uses them to pin an
+        episode; layout seeds below EVAL_SEED_RANGE are reserved for evaluation."""
         super().reset(seed=seed)
+        options = options or {}
+        if "size" in options:
+            self.set_size(int(options["size"]))
+        self.size = self.next_size
+        self.offset = -(self.size - 1) // 2
 
-        if not self.fixed:
-            self.layout = self._make_layout(self.size, seed=int(self.np_random.integers(2**31)))
-            self.segments = self._find_segments()
+        if self.fixed:
+            self.layout_seed = 0
+        elif "layout_seed" in options:
+            self.layout_seed = int(options["layout_seed"])
+        else:
+            self.layout_seed = int(self.np_random.integers(EVAL_SEED_RANGE, 2**31))
+        self.layout = self._make_layout(self.size, seed=self.layout_seed)
+        self.segments = self._find_segments()
 
         p.resetSimulation()
         p.setGravity(0, 0, -9.8)
@@ -166,6 +213,7 @@ class MazeEnv(gym.Env):
 
         # Create walls (Grid Maze, 1 = Wall, 0 = Empty)
         self.walls = []
+        self.wall_tile = {}   # body id -> (r, c); lets a lidar hit say which tile is a wall
         wall_visual_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5, 0.5, 1], rgbaColor=[0.7, 0.7, 0.7, 1])
         wall_collision_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.5, 0.5, 1])
 
@@ -173,10 +221,12 @@ class MazeEnv(gym.Env):
         for row_idx, row in enumerate(self.layout):
             for col_idx, cell in enumerate(row):
                 if cell == 1:
-                    self.walls.append(p.createMultiBody(baseMass=0,
-                                                      baseCollisionShapeIndex=wall_collision_shape,
-                                                      baseVisualShapeIndex=wall_visual_shape,
-                                                      basePosition=[col_idx + off, row_idx + off, 1]))
+                    wid = p.createMultiBody(baseMass=0,
+                                            baseCollisionShapeIndex=wall_collision_shape,
+                                            baseVisualShapeIndex=wall_visual_shape,
+                                            basePosition=[col_idx + off, row_idx + off, 1])
+                    self.walls.append(wid)
+                    self.wall_tile[wid] = (row_idx, col_idx)
 
         open_cells = [(r, c) for r, row in enumerate(self.layout) for c, v in enumerate(row) if v == 0]
         far = self.size // 2
@@ -189,9 +239,10 @@ class MazeEnv(gym.Env):
             r, c = open_cells[self.np_random.integers(len(open_cells))]
             goals = [(a, b) for a, b in open_cells if abs(a - r) + abs(b - c) >= far]
             gr, gc = goals[self.np_random.integers(len(goals))]
+        self.start_cell = (r, c)
         self.goal_cell = (gr, gc)
         agent_start_pos = [c + off, r + off, 0.5]
-        self.max_steps = self._route_budget((r, c), (gr, gc))
+        self.max_steps = self._time_budget(self.size)
 
         # Create Agent
         agent_radius = self.agent_radius
@@ -243,11 +294,141 @@ class MazeEnv(gym.Env):
         self.step_count = 0
         self.last_cell = self._cell(agent_start_pos[:2])
         self.visits = {self.last_cell: 1}  # tile -> times entered
+        self.known = np.full((self.size, self.size), -1, dtype=np.int8)  # own map: -1 unknown, 0 open, 1 wall
+        self.searched = np.zeros((self.size, self.size), dtype=bool)  # tiles the goal is known not to be on
+        self.goal_seen_cell = None
         return self._get_obs(), {}
 
     @staticmethod
     def _cell(xy):
         return (int(round(xy[0])), int(round(xy[1])))
+
+    def _tile(self, xy):
+        """World (x, y) -> map tile (r, c)."""
+        return (int(round(xy[1])) - self.offset, int(round(xy[0])) - self.offset)
+
+    def _in_map(self, t):
+        return 0 <= t[0] < self.size and 0 <= t[1] < self.size
+
+    def _mark_ray(self, origin, u, reading, hit_id, scan=False):
+        """Fold one range reading into the map: tiles along the free part of the ray are open; a wall body
+        hit marks that wall's tile. Tiles already known are never overwritten.
+        scan=True (world-axis rays): tiles whose centre lies on the clear stretch of the agent's own row/column
+        are also ruled out as goal locations, since the goal would have been in line of sight from there."""
+        d = 0.25
+        while d <= reading - 0.3:   # stay clear of the hit point, which sits on a tile edge
+            t = self._tile(origin + d * u)
+            if self._in_map(t) and self.known[t] == -1:
+                self.known[t] = 0
+            d += 0.25
+        if scan:
+            axis = 0 if u[0] else 1
+            sign = u[axis]
+            if abs(origin[1 - axis] - round(origin[1 - axis])) < 0.35:   # ray stays inside the row/column strip
+                k = 0
+                while True:
+                    centre = round(origin[axis]) + sign * k
+                    if sign * (centre - origin[axis]) > reading - 0.3:
+                        break
+                    if sign * (centre - origin[axis]) >= -0.35:
+                        xy = origin.copy()
+                        xy[axis] = centre
+                        xy[1 - axis] = round(origin[1 - axis])
+                        t = self._tile(xy)
+                        if self._in_map(t):
+                            self.searched[t] = True
+                    k += 1
+        t = self.wall_tile.get(hit_id)
+        if t is not None and self.known[t] == -1:
+            self.known[t] = 1
+
+    def _update_map(self, pos, yaw, readings, hit_ids):
+        """Own map from the noisy lidar (+ 4 world-axis scan rays) and odometry; no access to the layout."""
+        origin = np.array(pos[:2])
+        t = self._tile(origin)
+        if not self._in_map(t):   # knocked out of the maze by the physics: nothing sensible to map
+            return
+        self.known[t] = 0   # where we stand is open (and the goal is not here, or we would have won)
+        self.searched[t] = True
+        n = self.num_lidar_rays
+        for i in range(n):
+            a = yaw + (i - n / 2) * (2 * np.pi / n)
+            self._mark_ray(origin, np.array([np.cos(a), np.sin(a)]), readings[i], hit_ids[i])
+        r0 = self.agent_radius + 0.01
+        starts = [[pos[0] + r0 * c, pos[1] + r0 * s, pos[2]] for c, s in self.CARDINALS]
+        ends = [[pos[0] + self.lidar_range * c, pos[1] + self.lidar_range * s, pos[2]] for c, s in self.CARDINALS]
+        hits = p.rayTestBatch(starts, ends)
+        noise = self.LIDAR_NOISE * self.np_random.standard_normal(len(hits))
+        for (c, s), h, e in zip(self.CARDINALS, hits, noise):
+            reading = float(np.clip(r0 + h[2] * (self.lidar_range - r0) + e, 0.0, self.lidar_range))
+            self._mark_ray(origin, np.array([c, s]), reading, h[0], scan=True)
+        if self._goal_visible(pos):
+            gt = self._tile(self.goal_pos)
+            self.goal_seen_cell = gt
+            self.known[gt] = 0
+            d = 0.25
+            gd = np.linalg.norm(self.goal_pos - origin)
+            while d < gd:   # the line of sight is free space
+                tt = self._tile(origin + d * (self.goal_pos - origin) / gd)
+                if self.known[tt] == -1:
+                    self.known[tt] = 0
+                d += 0.25
+
+    def _route(self):
+        """Path (tiles, from the current one) over the known map to the remembered goal, else to the nearest
+        frontier (open tile next to an unknown one, or one the goal has not been ruled out from).
+        None if nothing is left to explore."""
+        pos, _ = self.get_pose()
+        start = self._tile(pos)
+        known, n = self.known, self.size
+        if not self._in_map(start):
+            return None
+
+        def passable(t):
+            return 0 <= t[0] < n and 0 <= t[1] < n and known[t] == 0
+
+        def unknown_nbrs(t):
+            return [(t[0] + dr, t[1] + dc) for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                    if 0 <= t[0] + dr < n and 0 <= t[1] + dc < n and known[t[0] + dr, t[1] + dc] == -1]
+
+        if self.goal_seen_cell is not None:
+            path = self._bfs(start, passable, lambda t: t == self.goal_seen_cell)
+            if path is not None:
+                return path
+        path = self._bfs(start, passable, lambda t: not self.searched[t] or bool(unknown_nbrs(t)))
+        if path is not None and len(path) == 1:   # standing on the frontier: step into the unknown tile
+            nb = unknown_nbrs(start)
+            if nb:
+                path.append(nb[0])
+        return path
+
+    def waypoint(self):
+        """World (x, y) centre of the next tile on the route from `_route`, or None."""
+        path = self._route()
+        if path is None or len(path) < 2:
+            return None
+        return np.array([path[1][1] + self.offset, path[1][0] + self.offset], dtype=float)
+
+    def _crop(self, pos, yaw):
+        """CROP x CROP window of the map in the agent's frame (heading snapped to a world axis):
+        rows run far -> near ahead, columns left -> right. +1 open, 0 unknown, -1 wall / outside."""
+        k = int(round(yaw / (np.pi / 2))) % 4
+        fx, fy = self.CARDINALS[k]          # forward in world (x, y) = (col, row) steps
+        lx, ly = -fy, fx                    # left
+        r, c = self._tile(pos)
+        h = self.CROP // 2
+        out = np.zeros((self.CROP, self.CROP), dtype=np.float32)
+        for i in range(self.CROP):
+            ahead = h - i
+            for j in range(self.CROP):
+                left = h - j
+                t = (int(r + ahead * fy + left * ly), int(c + ahead * fx + left * lx))
+                if not self._in_map(t):
+                    out[i, j] = -1.0
+                else:
+                    v = self.known[t]
+                    out[i, j] = 0.0 if v == -1 else (1.0 if v == 0 else -1.0)
+        return out.ravel()
 
     def _move_obstacles(self, speed=0.1):
         for o in self.obstacles:
@@ -328,7 +509,7 @@ class MazeEnv(gym.Env):
         if hit_obstacle:
             reward -= self.OBSTACLE_PENALTY
 
-        return obs, reward, terminated, truncated, {"goal": terminated}
+        return obs, reward, terminated, truncated, {"goal": terminated, "hit_obstacle": hit_obstacle}
 
     def _goal_visible(self, pos):
         """Line of sight to the goal: the goal sphere has no collision shape, so a clear ray means no wall/obstacle between."""
@@ -359,14 +540,16 @@ class MazeEnv(gym.Env):
 
         # Lidar
         lidar_readings = []
+        hit_ids = []
         for i in range(self.num_lidar_rays):
             angle = yaw + (i - self.num_lidar_rays/2) * (np.pi / self.num_lidar_rays) * 2
             c, s = np.cos(angle), np.sin(angle)
             r0 = self.agent_radius + 0.01  # start outside own body
             ray_from = [pos[0] + r0 * c, pos[1] + r0 * s, pos[2]]
             ray_to = [pos[0] + self.lidar_range * c, pos[1] + self.lidar_range * s, pos[2]]
-            hit_fraction = p.rayTest(ray_from, ray_to)[0][2]
-            lidar_readings.append(r0 + hit_fraction * (self.lidar_range - r0))
+            hit = p.rayTest(ray_from, ray_to)[0]
+            hit_ids.append(hit[0])
+            lidar_readings.append(r0 + hit[2] * (self.lidar_range - r0))
         # Sensor noise
         lidar_readings = np.clip(np.array(lidar_readings)
                                  + self.LIDAR_NOISE * self.np_random.standard_normal(self.num_lidar_rays),
@@ -380,8 +563,17 @@ class MazeEnv(gym.Env):
             n = self.visits.get((cx + int(round(np.cos(a))), cy + int(round(np.sin(a)))), 0)
             visits.append(min(n, 3) / 3)
 
+        # Own map + route cue
+        self._update_map(pos, yaw, lidar_readings, hit_ids)
+        path = self._route()
+        cue = [0.0, 0.0, 0.0, 0.0]
+        if path is not None and len(path) >= 2:
+            nx, ny = path[1][1] + self.offset, path[1][0] + self.offset
+            err = math.atan2(ny - agent_pos[1], nx - agent_pos[0]) - yaw
+            cue = [1.0, (len(path) - 1) / self.size, np.sin(err), np.cos(err)]
+
         time_left = 1.0 - self.step_count / self.max_steps
-        obs = np.concatenate([[time_left], goal_obs, visits, lidar_readings])
+        obs = np.concatenate([[time_left], goal_obs, visits, lidar_readings, cue, self._crop(agent_pos, yaw)])
         return obs.astype(np.float32)
 
     def close(self):

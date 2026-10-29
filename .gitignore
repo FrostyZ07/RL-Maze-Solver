@@ -1,2 +1,5 @@
 logs/
 ppo_maze_final.zip
+results/
+.venv/
+__pycache__/
