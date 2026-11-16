@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faultwalk"
+dynamic = ["version"]
+description = "Fault-tolerant quadruped (Unitree Go2) locomotion with reinforcement learning"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "mujoco",
+    "onnxruntime",
+    "onnx",
+]
+
+[project.optional-dependencies]
+# The training stack (PyTorch, mjlab) is installed inside the Kaggle/Colab
+# notebooks, not here; this extra is a placeholder.
+train = []
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "faultwalk.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["legacy"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

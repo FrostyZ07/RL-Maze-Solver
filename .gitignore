@@ -1,5 +1,46 @@
-logs/
-ppo_maze_final.zip
-results/
-.venv/
+# Python caches and build output
 __pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Web demo
+node_modules/
+
+# Model files and training output (models live on Hugging Face Hub)
+*.zip
+*.pt
+*.pth
+*.ckpt
+*.onnx
+!assets/**/*.onnx
+logs/
+runs/
+wandb/
+outputs/
+results/
+
+# Kaggle / Colab downloads
+kaggle_outputs/
+/kaggle/
+*.kaggle.json
+kaggle.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
